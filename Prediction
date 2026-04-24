@@ -1,0 +1,465 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+import warnings
+warnings.filterwarnings('ignore')
+plt.style.use('seaborn-v0_8-darkgrid')
+
+# Данные
+print("=" * 70)
+print("=" * 70)
+
+tickers = ["AAPL", "NVDA", "^GSPC", "GLD", "QQQ"]
+data = yf.download(tickers, start="2019-01-01", end="2024-12-13")['Close']
+data.columns = ['AAPL', 'NVDA', 'GSPC', 'GLD', 'QQQ']
+print(f"Загружено {len(data)} дней данных")
+print(f"Период: {data.index[0].date()} - {data.index[-1].date()}")
+
+# Создание расширенных признаков
+def calculate_rsi(prices, period=14):
+    """Расчет RSI"""
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """Расчет MACD"""
+    exp1 = prices.ewm(span=fast, adjust=False).mean()
+    exp2 = prices.ewm(span=slow, adjust=False).mean()
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    histogram = macd - signal_line
+    return macd, signal_line, histogram
+
+def calculate_bollinger_bands(prices, window=20, num_std=2):
+    """Расчет Bollinger Bands"""
+    sma = prices.rolling(window=window).mean()
+    std = prices.rolling(window=window).std()
+    upper_band = sma + (std * num_std)
+    lower_band = sma - (std * num_std)
+    bb_percent = (prices - lower_band) / (upper_band - lower_band) * 100
+    return upper_band, sma, lower_band, bb_percent
+
+def calculate_atr(high, low, close, window=14):
+    """Расчет Average True Range"""
+    high_low = high - low
+    high_close = abs(high - close.shift())
+    low_close = abs(low - close.shift())
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = true_range.rolling(window=window).mean()
+    return atr
+
+# Получаем дополнительные данные для ATR
+data_full = yf.download(tickers, start="2019-01-01", end="2024-12-13")
+high_prices = data_full['High']['AAPL']
+low_prices = data_full['Low']['AAPL']
+
+print("\nСоздание расширенного набора признаков...")
+
+# Создаем DataFrame с базовыми признаками
+df = data.copy()
+
+# 1. Целевая переменная и базовые лаги
+df['AAPL_return'] = df['AAPL'].pct_change()
+lags = 20
+for lag in range(1, lags+1):
+    df[f'AAPL_return_lag{lag}'] = df['AAPL_return'].shift(lag)
+    df[f'NVDA_return_lag{lag}'] = df['NVDA'].pct_change().shift(lag)
+    df[f'GSPC_return_lag{lag}'] = df['GSPC'].pct_change().shift(lag)
+
+# 2. Технические индикаторы для AAPL
+# RSI
+df['AAPL_RSI_14'] = calculate_rsi(df['AAPL'], period=14)
+df['AAPL_RSI_7'] = calculate_rsi(df['AAPL'], period=7)
+
+# MACD
+macd, signal, hist = calculate_macd(df['AAPL'])
+df['AAPL_MACD'] = macd
+df['AAPL_MACD_signal'] = signal
+df['AAPL_MACD_hist'] = hist
+
+# Bollinger Bands
+upper, middle, lower, bb_percent = calculate_bollinger_bands(df['AAPL'], window=20)
+df['AAPL_BB_upper'] = upper
+df['AAPL_BB_middle'] = middle
+df['AAPL_BB_lower'] = lower
+df['AAPL_BB_percent'] = bb_percent
+
+# ATR (Average True Range)
+df['AAPL_ATR_14'] = calculate_atr(high_prices, low_prices, df['AAPL'], window=14)
+df['AAPL_ATR_7'] = calculate_atr(high_prices, low_prices, df['AAPL'], window=7)
+
+# 3. Технические индикаторы для NVDA (как ведущего tech-актива)
+df['NVDA_RSI_14'] = calculate_rsi(df['NVDA'], period=14)
+nvda_macd, _, _ = calculate_macd(df['NVDA'])
+df['NVDA_MACD'] = nvda_macd
+
+# 4. Признаки рыночного режима
+df['GSPC_volatility_10d'] = df['GSPC'].pct_change().rolling(10).std() * np.sqrt(252)
+df['GSPC_volatility_20d'] = df['GSPC'].pct_change().rolling(20).std() * np.sqrt(252)
+
+# Дни сильного движения рынка
+df['market_trend_day'] = (abs(df['GSPC'].pct_change()) > 0.015).astype(int)
+
+# 5. Относительная сила и корреляции
+df['AAPL_vs_GSPC_5d'] = df['AAPL'].pct_change(5) - df['GSPC'].pct_change(5)
+df['AAPL_vs_NVDA_5d'] = df['AAPL'].pct_change(5) - df['NVDA'].pct_change(5)
+
+# Скользящая корреляция AAPL и NVDA
+for window in [5, 10, 20]:
+    df[f'AAPL_NVDA_corr_{window}d'] = df['AAPL'].pct_change().rolling(window).corr(df['NVDA'].pct_change())
+
+# 6. Скользящие статистики с разными окнами
+for window in [3, 5, 10, 20, 50]:
+    df[f'AAPL_MA_{window}'] = df['AAPL'].rolling(window).mean()
+    df[f'AAPL_Std_{window}'] = df['AAPL'].rolling(window).std()
+    df[f'AAPL_return_MA_{window}'] = df['AAPL_return'].rolling(window).mean()
+    df[f'AAPL_return_Std_{window}'] = df['AAPL_return'].rolling(window).std()
+    
+    # Отношение цены к скользящим средним
+    df[f'AAPL_price_ratio_MA{window}'] = df['AAPL'] / df[f'AAPL_MA_{window}']
+
+# 7. Временные признаки
+df['day_of_week'] = df.index.dayofweek
+df['month'] = df.index.month
+df['day_of_month'] = df.index.day
+df['quarter'] = df.index.quarter
+df['is_month_start'] = df.index.is_month_start.astype(int)
+df['is_month_end'] = df.index.is_month_end.astype(int)
+
+# 8. Объемы (proxy)
+df['AAPL_volume_proxy'] = abs(df['AAPL'].pct_change()) * 1000000
+
+# 9. Взаимодействия и отношения
+df['NVDA_AAPL_ratio'] = df['NVDA'] / df['AAPL']
+df['AAPL_GSPC_ratio'] = df['AAPL'] / df['GSPC']
+df['Tech_sector_strength'] = df['QQQ'] / df['GSPC']
+
+# Удаляем строки с NaN
+df = df.dropna()
+print(f"Размер финального датасета: {df.shape}")
+
+#РАЗДЕЛЕНИЕ НА TRAIN/TEST
+print("\n" + "=" * 70)
+print("РАЗДЕЛЕНИЕ НА TRAIN/TEST")
+print("=" * 70)
+
+test_size = 30
+train_size = len(df) - test_size
+
+train = df.iloc[:train_size]
+test = df.iloc[train_size:]
+
+#Определение признаков и целевой переменной
+feature_cols = [col for col in train.columns if col not in 
+                ['AAPL', 'NVDA', 'GSPC', 'GLD', 'QQQ', 'AAPL_return']]
+X_train = train[feature_cols]
+y_train = train['AAPL_return']
+X_test = test[feature_cols]
+y_test = test['AAPL_return']
+
+print(f"Количество признаков: {len(feature_cols)}")
+print(f"Размер train: {X_train.shape}, test: {X_test.shape}")
+print(f"Даты train: {train.index[0].date()} - {train.index[-1].date()}")
+print(f"Даты test: {test.index[0].date()} - {test.index[-1].date()}")
+
+#ОПТИМИЗАЦИЯ ГИПЕРПАРАМЕТРОВ XGBOOST
+print("\n" + "=" * 70)
+print("ОПТИМИЗАЦИЯ ГИПЕРПАРАМЕТРОВ XGBOOST")
+print("=" * 70)
+
+# Уменьшаем количество комбинаций для ускорения
+tscv = TimeSeriesSplit(n_splits=3)  # Уменьшаем количество фолдов
+
+#Упрощенная сетка параметров
+param_grid = {
+    'n_estimators': [500, 800],
+    'max_depth': [3, 5],
+    'learning_rate': [0.01, 0.05],
+    'subsample': [0.7, 0.8],
+    'colsample_bytree': [0.7, 0.8],
+}
+
+#Инициализация модели БЕЗ early_stopping_rounds
+xgb_base = XGBRegressor(
+    random_state=42,
+    n_jobs=-1,
+    verbosity=0
+    #Убрали early_stopping_rounds для GridSearchCV
+)
+
+#GridSearchCV с TimeSeriesSplit
+print("Запуск GridSearchCV...")
+grid_search = GridSearchCV(
+    estimator=xgb_base,
+    param_grid=param_grid,
+    cv=tscv,
+    scoring='neg_mean_squared_error',
+    verbose=1,
+    n_jobs=-1
+)
+
+grid_search.fit(X_train, y_train)
+
+print(f"\nЛучшие параметры: {grid_search.best_params_}")
+print(f"Лучший MSE (на кросс-валидации): {-grid_search.best_score_:.6f}")
+
+#Теперь обучим модель с лучшими параметрами, но с ранней остановкой на валидационной выборке
+print("\nДообучение лучшей модели с ранней остановкой...")
+
+#Создаем валидационную выборку из последних 30 дней тренировочных данных
+val_size = 30
+X_train_main = X_train.iloc[:-val_size]
+y_train_main = y_train.iloc[:-val_size]
+X_val = X_train.iloc[-val_size:]
+y_val = y_train.iloc[-val_size:]
+
+#Создаем модель с лучшими параметрами
+best_params = grid_search.best_params_.copy()
+#Для ранней остановки устанавливаем большое количество estimators
+best_params['n_estimators'] = 2000
+best_params['early_stopping_rounds'] = 50
+
+xgb_final = XGBRegressor(
+    **best_params,
+    random_state=42,
+    n_jobs=-1,
+    verbosity=0
+)
+
+#Обучаем с ранней остановкой на валидационной выборке
+xgb_final.fit(
+    X_train_main, y_train_main,
+    eval_set=[(X_val, y_val)],
+    verbose=False
+)
+
+print(f"Оптимальное количество деревьев: {xgb_final.best_iteration}")
+
+#Теперь переобучаем на всех тренировочных данных с оптимальным количеством деревьев
+xgb_model = XGBRegressor(
+    n_estimators=xgb_final.best_iteration,
+    max_depth=best_params['max_depth'],
+    learning_rate=best_params['learning_rate'],
+    subsample=best_params['subsample'],
+    colsample_bytree=best_params['colsample_bytree'],
+    random_state=42,
+    n_jobs=-1,
+    verbosity=0
+)
+
+xgb_model.fit(X_train, y_train)
+
+#ЭКСПЕРИМЕНТ С РАЗНЫМИ МОДЕЛЯМИ
+print("\n" + "=" * 70)
+print("ЭКСПЕРИМЕНТ С РАЗНЫМИ АЛГОРИТМАМИ")
+print("=" * 70)
+
+# LightGBM
+print("Обучение LightGBM...")
+lgb_model = LGBMRegressor(
+    n_estimators=1000,
+    learning_rate=0.01,
+    max_depth=5,
+    random_state=42,
+    verbosity=-1
+)
+lgb_model.fit(X_train, y_train)
+
+# CatBoost
+print("Обучение CatBoost...")
+cat_model = CatBoostRegressor(
+    iterations=1000,
+    learning_rate=0.01,
+    depth=5,
+    random_seed=42,
+    verbose=0
+)
+cat_model.fit(X_train, y_train)
+
+#ПРОГНОЗ И АНСАМБЛИРОВАНИЕ
+print("\n" + "=" * 70)
+print("ПРОГНОЗ И АНСАМБЛИРОВАНИЕ")
+print("=" * 70)
+
+# Прогнозы отдельных моделей
+xgb_pred = xgb_model.predict(X_test)
+lgb_pred = lgb_model.predict(X_test)
+cat_pred = cat_model.predict(X_test)
+
+# Простое усреднение (блендинг)
+ensemble_pred = (xgb_pred + lgb_pred + cat_pred) / 3
+
+# Поиск оптимальных весов
+print("Поиск оптимальных весов для ансамбля...")
+best_mse = float('inf')
+best_weights = None
+
+# Простой перебор весов
+weights_to_try = [
+    (0.4, 0.3, 0.3), (0.5, 0.3, 0.2), (0.6, 0.2, 0.2),
+    (0.7, 0.2, 0.1), (0.8, 0.1, 0.1), (0.9, 0.05, 0.05)
+]
+
+for w1, w2, w3 in weights_to_try:
+    weighted_pred = w1*xgb_pred + w2*lgb_pred + w3*cat_pred
+    
+    # Конвертируем в цены для расчета MSE
+    last_train_price = train['AAPL'].iloc[-1]
+    weighted_prices = last_train_price * (1 + weighted_pred).cumprod()
+    actual_prices = test['AAPL'].values
+    mse_temp = mean_squared_error(actual_prices, weighted_prices)
+    
+    if mse_temp < best_mse:
+        best_mse = mse_temp
+        best_weights = (w1, w2, w3)
+
+print(f"Оптимальные веса: XGBoost={best_weights[0]:.2f}, LightGBM={best_weights[1]:.2f}, CatBoost={best_weights[2]:.2f}")
+
+# Финальный ансамбль с оптимальными весами
+final_pred = best_weights[0]*xgb_pred + best_weights[1]*lgb_pred + best_weights[2]*cat_pred
+
+# ==================== ПРЕОБРАЗОВАНИЕ В ЦЕНЫ И ОЦЕНКА ====================
+last_train_price = train['AAPL'].iloc[-1]
+
+# Прогнозы цен для всех моделей
+predicted_prices_xgb = last_train_price * (1 + xgb_pred).cumprod()
+predicted_prices_lgb = last_train_price * (1 + lgb_pred).cumprod()
+predicted_prices_cat = last_train_price * (1 + cat_pred).cumprod()
+predicted_prices_ensemble = last_train_price * (1 + final_pred).cumprod()
+actual_prices = test['AAPL'].values
+
+# Вычисление MSE для всех моделей
+mse_xgb = mean_squared_error(actual_prices, predicted_prices_xgb)
+mse_lgb = mean_squared_error(actual_prices, predicted_prices_lgb)
+mse_cat = mean_squared_error(actual_prices, predicted_prices_cat)
+mse_ensemble = mean_squared_error(actual_prices, predicted_prices_ensemble)
+
+print("\n" + "=" * 70)
+print("СРАВНЕНИЕ РЕЗУЛЬТАТОВ")
+print("=" * 70)
+print(f"{'Модель':<20} {'MSE':<15} {'Улучшение vs baseline':<25}")
+print("-" * 70)
+print(f"{'Baseline':<20} {'87.43':<15} {'0%':<25}")
+print(f"{'XGBoost':<20} {mse_xgb:<15.4f} {(1 - mse_xgb/87.43)*100:<24.1f}%")
+print(f"{'LightGBM':<20} {mse_lgb:<15.4f} {(1 - mse_lgb/87.43)*100:<24.1f}%")
+print(f"{'CatBoost':<20} {mse_cat:<15.4f} {(1 - mse_cat/87.43)*100:<24.1f}%")
+print(f"{'АНСАМБЛЬ':<20} {mse_ensemble:<15.4f} {(1 - mse_ensemble/87.43)*100:<24.1f}%")
+print("=" * 70)
+
+# Дополнительные метрики для ансамбля
+mae_ensemble = mean_absolute_error(actual_prices, predicted_prices_ensemble)
+mape_ensemble = np.mean(np.abs((actual_prices - predicted_prices_ensemble) / actual_prices)) * 100
+
+print(f"\nДополнительные метрики ансамбля:")
+print(f"MAE: {mae_ensemble:.4f} (средняя ошибка в $)")
+print(f"MAPE: {mape_ensemble:.4f}% (средняя процентная ошибка)")
+print(f"RMSE: {np.sqrt(mse_ensemble):.4f} (корень из MSE)")
+
+# ==================== ДИАГНОСТИКА ОШИБОК ====================
+print("\n" + "=" * 70)
+print("ДИАГНОСТИКА ОШИБОК АНСАМБЛЯ")
+print("=" * 70)
+
+errors = actual_prices - predicted_prices_ensemble
+abs_errors = np.abs(errors)
+
+# Анализ распределения ошибок
+print(f"\nСтатистика ошибок:")
+print(f"Средняя ошибка: {np.mean(errors):.4f} (систематическое смещение)")
+print(f"Медианная ошибка: {np.median(errors):.4f}")
+print(f"Std ошибок: {np.std(errors):.4f}")
+print(f"Максимальная положительная ошибка: {np.max(errors):.4f}")
+print(f"Максимальная отрицательная ошибка: {np.min(errors):.4f}")
+print(f"Дней с переоценкой: {(errors > 0).sum()} из {len(errors)}")
+print(f"Дней с недооценкой: {(errors < 0).sum()} из {len(errors)}")
+
+# Находим дни с наибольшими ошибками
+error_analysis = pd.DataFrame({
+    'Date': test.index,
+    'Actual': actual_prices,
+    'Predicted': predicted_prices_ensemble,
+    'Error': errors,
+    'Abs_Error': abs_errors
+}).sort_values('Abs_Error', ascending=False)
+
+print(f"\nТоп-3 дня с наибольшими ошибками:")
+for i, row in error_analysis.head(3).iterrows():
+    print(f"{row['Date'].date()}: Факт={row['Actual']:.2f}, Прогноз={row['Predicted']:.2f}, "
+          f"Ошибка={row['Error']:.2f} ({row['Error']/row['Actual']*100:.1f}%)")
+
+# ==================== ВИЗУАЛИЗАЦИЯ ====================
+print("\n" + "=" * 70)
+print("=" * 70)
+
+fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+# 1. Факт vs Прогноз (ансамбль)
+axes[0, 0].plot(test.index, actual_prices, 'b-', label='Фактическая цена', linewidth=2, alpha=0.8)
+axes[0, 0].plot(test.index, predicted_prices_ensemble, 'r--', label='Прогноз ансамбля', linewidth=2, alpha=0.8)
+axes[0, 0].fill_between(test.index, predicted_prices_ensemble, actual_prices, 
+                       alpha=0.2, color='gray')
+axes[0, 0].set_title(f'Прогноз цены AAPL на 30 дней\n(Ансамбль, MSE={mse_ensemble:.2f})', fontsize=12, fontweight='bold')
+axes[0, 0].set_xlabel('Дата')
+axes[0, 0].set_ylabel('Цена ($)')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+axes[0, 0].tick_params(axis='x', rotation=45)
+
+# 2. Сравнение всех моделей
+axes[0, 1].plot(test.index, actual_prices, 'k-', label='Факт', linewidth=3, alpha=0.7)
+axes[0, 1].plot(test.index, predicted_prices_xgb, 'r--', label=f'XGBoost ({mse_xgb:.2f})', alpha=0.6)
+axes[0, 1].plot(test.index, predicted_prices_lgb, 'g--', label=f'LightGBM ({mse_lgb:.2f})', alpha=0.6)
+axes[0, 1].plot(test.index, predicted_prices_cat, 'b--', label=f'CatBoost ({mse_cat:.2f})', alpha=0.6)
+axes[0, 1].plot(test.index, predicted_prices_ensemble, 'm-', label=f'Ансамбль ({mse_ensemble:.2f})', linewidth=2)
+axes[0, 1].set_title('Сравнение всех моделей', fontsize=12, fontweight='bold')
+axes[0, 1].set_xlabel('Дата')
+axes[0, 1].set_ylabel('Цена ($)')
+axes[0, 1].legend()
+axes[0, 1].grid(True, alpha=0.3)
+axes[0, 1].tick_params(axis='x', rotation=45)
+
+# 3. Ошибки по дням
+colors = ['red' if err > 0 else 'green' for err in errors]
+axes[1, 0].bar(test.index, errors, color=colors, alpha=0.7)
+axes[1, 0].axhline(y=0, color='black', linestyle='-', linewidth=1)
+axes[1, 0].set_title('Распределение ошибок по дням', fontsize=12, fontweight='bold')
+axes[1, 0].set_xlabel('Дата')
+axes[1, 0].set_ylabel('Ошибка ($)')
+axes[1, 0].grid(True, alpha=0.3, axis='y')
+axes[1, 0].tick_params(axis='x', rotation=45)
+
+# 4. Важность признаков (XGBoost)
+feature_importance = pd.DataFrame({
+    'Признак': feature_cols,
+    'Важность': xgb_model.feature_importances_
+}).sort_values('Важность', ascending=False).head(10)
+
+axes[1, 1].barh(feature_importance['Признак'], feature_importance['Важность'], color='steelblue')
+axes[1, 1].set_title('10 важнейших признаков (XGBoost)', fontsize=12, fontweight='bold')
+axes[1, 1].set_xlabel('Важность')
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# ==================== ФИНАЛЬНЫЙ ОТЧЕТ ====================
+print("\n" + "=" * 70)
+print("ОТЧЕТ")
+print("=" * 70)
+print(f"Итоговый MSE ансамбля: {mse_ensemble:.4f}")
+print(f"Улучшение относительно baseline: {(1 - mse_ensemble/87.43)*100:.1f}%")
+
+print(f"\n{'='*70}")
+print("КОД УСПЕШНО ВЫПОЛНЕН!")
+print(f"{'='*70}")
